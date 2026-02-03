@@ -1,4 +1,5 @@
 import os
+import json
 import pandas as pd
 import pandas_gbq
 from dotenv import load_dotenv
@@ -9,6 +10,44 @@ load_dotenv()
 
 # Batch size for processing
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "10000"))
+
+# Checkpoint directory (supports parallel ingestion)
+CHECKPOINT_DIR = os.getenv("CHECKPOINT_DIR", ".")
+
+
+def get_checkpoint_filename(bq_dataset_table):
+    """Generate unique checkpoint filename based on target table."""
+    # Replace dots with underscores to create valid filename
+    safe_name = bq_dataset_table.replace(".", "_")
+    return os.path.join(CHECKPOINT_DIR, f"checkpoint_{safe_name}.json")
+
+
+def save_checkpoint(checkpoint_data, bq_dataset_table):
+    """Save checkpoint to file for resumable ingestion."""
+    checkpoint_file = get_checkpoint_filename(bq_dataset_table)
+    with open(checkpoint_file, 'w') as f:
+        json.dump(checkpoint_data, f, indent=2)
+    print(f"   💾 Checkpoint saved: batch {checkpoint_data['last_completed_batch'] + 1} ({checkpoint_file})")
+
+
+def load_checkpoint(bq_dataset_table):
+    """Load checkpoint from file if exists."""
+    checkpoint_file = get_checkpoint_filename(bq_dataset_table)
+    if os.path.exists(checkpoint_file):
+        with open(checkpoint_file, 'r') as f:
+            checkpoint = json.load(f)
+        print(f"   📂 Checkpoint found: resuming from batch {checkpoint['last_completed_batch'] + 2}")
+        print(f"      File: {checkpoint_file}")
+        return checkpoint
+    return None
+
+
+def clear_checkpoint(bq_dataset_table):
+    """Remove checkpoint file after successful completion."""
+    checkpoint_file = get_checkpoint_filename(bq_dataset_table)
+    if os.path.exists(checkpoint_file):
+        os.remove(checkpoint_file)
+        print(f"   🧹 Checkpoint file cleared: {checkpoint_file}")
 
 def get_pg_config():
     """Get PostgreSQL configuration from environment variables."""
@@ -105,11 +144,28 @@ def ingest_pg_to_bq_auto(bq_project_id, bq_dataset_table, sql_query, batch_size=
     print(f"   Batch size: {batch_size:,}")
     print(f"   Total batches: {total_batches}")
     
+    # Check for existing checkpoint (resume capability)
+    checkpoint = load_checkpoint(bq_dataset_table)
+    start_batch = 0
+    already_uploaded = 0
+    
+    if checkpoint:
+        # Validate checkpoint matches current job
+        if (checkpoint.get('total_rows') == total_rows and
+            checkpoint.get('batch_size') == batch_size):
+            start_batch = checkpoint['last_completed_batch'] + 1
+            already_uploaded = checkpoint.get('total_uploaded', start_batch * batch_size)
+            print(f"   ✅ Resuming from batch {start_batch + 1}/{total_batches}")
+            print(f"   📊 Already uploaded: {already_uploaded:,} rows")
+        else:
+            print("   ⚠️ Checkpoint mismatch (different job parameters), starting fresh")
+            clear_checkpoint(bq_dataset_table)
+    
     # Step 3: Process in batches
     print(f"\nStep 3/5: Processing data in batches...")
-    total_uploaded = 0
+    total_uploaded = already_uploaded
     
-    for batch_num in range(total_batches):
+    for batch_num in range(start_batch, total_batches):
         offset = batch_num * batch_size
         
         print(f"\n   📦 Batch {batch_num + 1}/{total_batches}")
@@ -119,8 +175,21 @@ def ingest_pg_to_bq_auto(bq_project_id, bq_dataset_table, sql_query, batch_size=
         batch_query = f"{sql_query} LIMIT {batch_size} OFFSET {offset}"
         
         print(f"      Fetching data...")
-        with engine.connect() as conn:
-            df = pd.read_sql(text(batch_query), conn)
+        try:
+            with engine.connect() as conn:
+                df = pd.read_sql(text(batch_query), conn)
+        except Exception as e:
+            print(f"      ❌ Error fetching data: {e}")
+            print(f"      💾 Progress saved. Run the script again to resume from batch {batch_num + 1}")
+            save_checkpoint({
+                'last_completed_batch': batch_num - 1,
+                'total_uploaded': total_uploaded,
+                'total_rows': total_rows,
+                'batch_size': batch_size,
+                'bq_dataset_table': bq_dataset_table,
+                'bq_project_id': bq_project_id
+            }, bq_dataset_table)
+            raise
         
         rows_fetched = len(df)
         print(f"      ✅ Fetched {rows_fetched:,} rows")
@@ -129,26 +198,52 @@ def ingest_pg_to_bq_auto(bq_project_id, bq_dataset_table, sql_query, batch_size=
             print(f"      ⚠️ Empty batch, skipping...")
             continue
         
-        # Show schema on first batch only
-        if batch_num == 0:
-            print(f"\n   📊 Schema detected (from first batch):")
+        # Show schema on first batch only (or first batch after resume)
+        if batch_num == start_batch:
+            print(f"\n   📊 Schema detected (from current batch):")
             for col, dtype in df.dtypes.items():
                 print(f"      - {col}: {dtype}")
         
         # Step 4: Upload batch to BigQuery using pandas_gbq
         print(f"      Uploading to BigQuery...")
         
-        pandas_gbq.to_gbq(
-            dataframe=df,
-            destination_table=bq_dataset_table,
-            project_id=bq_project_id,
-            if_exists='append',  # Creates table if not exists, appends if exists
-            progress_bar=False   # Disable progress bar for cleaner batch output
-        )
+        try:
+            pandas_gbq.to_gbq(
+                dataframe=df,
+                destination_table=bq_dataset_table,
+                project_id=bq_project_id,
+                if_exists='append',  # Creates table if not exists, appends if exists
+                progress_bar=False   # Disable progress bar for cleaner batch output
+            )
+        except Exception as e:
+            print(f"      ❌ Error uploading to BigQuery: {e}")
+            print(f"      💾 Progress saved. Run the script again to resume from batch {batch_num + 1}")
+            save_checkpoint({
+                'last_completed_batch': batch_num - 1,
+                'total_uploaded': total_uploaded,
+                'total_rows': total_rows,
+                'batch_size': batch_size,
+                'bq_dataset_table': bq_dataset_table,
+                'bq_project_id': bq_project_id
+            }, bq_dataset_table)
+            raise
         
         total_uploaded += rows_fetched
         progress = (total_uploaded / total_rows) * 100
         print(f"      ✅ Batch uploaded | Progress: {total_uploaded:,}/{total_rows:,} ({progress:.1f}%)")
+        
+        # Save checkpoint after each successful batch
+        save_checkpoint({
+            'last_completed_batch': batch_num,
+            'total_uploaded': total_uploaded,
+            'total_rows': total_rows,
+            'batch_size': batch_size,
+            'bq_dataset_table': bq_dataset_table,
+            'bq_project_id': bq_project_id
+        }, bq_dataset_table)
+    
+    # Clear checkpoint on successful completion
+    clear_checkpoint(bq_dataset_table)
     
     # Step 5: Summary
     print("\n" + "="*60)
